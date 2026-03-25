@@ -1,0 +1,12 @@
+bin/
+dist/
+vendor/
+.coverprofile
+.env
+.env.*
+*.log
+*.out
+*.test
+.DS_Store
+.idea/
+.vscode/
