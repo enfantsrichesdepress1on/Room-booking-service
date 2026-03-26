@@ -1,177 +1,468 @@
 # Room Booking Service
 
-Тестовое задание: сервис бронирования переговорок на Go + PostgreSQL + Docker Compose.
+Сервис бронирования переговорок на **Go + PostgreSQL + Docker Compose**.
 
-## Статус проекта
+Проект реализует обязательные пункты тестового задания и большую часть дополнительных:
+- JWT-авторизация с обязательным `POST /dummyLogin`
+- создание переговорок и расписаний
+- генерация и хранение слотов в PostgreSQL
+- бронирование только для роли `user`
+- идемпотентная отмена брони
+- список всех броней с пагинацией для `admin`
+- список будущих броней текущего пользователя для `user`
+- дополнительные `POST /register` и `POST /login`
+- опциональная генерация conference link через mock external service
+- unit-тесты и HTTP integration tests
+- Docker Compose, Makefile, линтер-конфиг
 
-Репозиторий доведён до состояния, в котором есть:
-- рабочая архитектурная основа под PostgreSQL;
-- SQL migration files;
-- unit-тесты бизнес-логики;
-- HTTP E2E flow-тесты;
-- отдельный PostgreSQL integration test scaffold;
-- Docker Compose и команды для локального прогона.
+---
 
-Важно: в этой среде не было доступа к сети для скачивания Go-модулей, поэтому финальная компиляция и запуск должны быть подтверждены локально командами из раздела **Проверка**.
+## 1. Бизнес-логика и роли
 
-## Что реализовано
+В системе есть две роли:
 
-### Обязательное
-- `/dummyLogin` с JWT и фиксированными UUID для `admin` и `user`.
-- `/_info`.
-- Создание переговорок (`admin`).
-- Создание расписания один раз (`admin`).
-- Генерация 30-минутных слотов системой.
-- Список переговорок.
-- Список доступных слотов по комнате и дате.
-- Создание брони только для `user`.
-- Идемпотентная отмена своей брони.
-- Список всех броней с пагинацией (`admin`).
-- Список будущих броней текущего пользователя (`user`).
-- Хранение времени в UTC.
-- Unit-тесты и HTTP integration/E2E тесты.
+### `admin`
+Может:
+- создавать переговорки
+- создавать расписание доступности переговорки
+- просматривать список всех броней с пагинацией
+- просматривать комнаты и доступные слоты
 
-### Дополнительно
-- `/register` и `/login`.
-- `createConferenceLink` через mock conference service.
-- `Makefile`.
-- Docker Compose.
-- Конфиг линтера.
-- SQL migration files.
-- Swagger scaffold.
+Не может:
+- создавать бронь
+- отменять чужие или свои брони как `admin`
 
-## Архитектурные решения
+### `user`
+Может:
+- просматривать комнаты
+- просматривать доступные слоты
+- создавать бронь на слот от своего имени
+- отменять **только свою** бронь
+- просматривать **только свои будущие** брони
 
-### Генерация слотов
-Выбран гибридный подход:
-- при создании расписания сервис генерирует слоты на окно вперёд (`14` дней);
-- при запросе слотов на конкретную дату сервис лениво дозаполняет отсутствующие слоты именно на эту дату.
+Не может:
+- создавать переговорки
+- создавать расписания
+- просматривать список всех броней
 
-Почему так:
-- у слотов есть стабильные UUID и они хранятся в БД;
-- горячий endpoint `/rooms/{roomId}/slots/list` работает по предсгенерированным данным;
-- при нагрузке это дешевле, чем каждый раз вычислять слоты на лету.
+---
 
-UUID слота детерминирован: `UUIDv5(roomId + startTimeUTC)`, поэтому повторная генерация не ломает ссылочную целостность.
+## 2. Что реализовано
 
-### Ограничения консистентности
-- одно расписание на комнату: `UNIQUE (room_id)` в `schedules`;
-- не более одной активной брони на слот: partial unique index на `bookings(slot_id) WHERE status='active'`;
-- уникальность слота: `UNIQUE (room_id, start_time, end_time)`.
+### Обязательная часть
+- `POST /dummyLogin`
+- `GET /_info`
+- создание переговорок (`admin`)
+- создание расписания один раз (`admin`)
+- автоматическая генерация 30-минутных слотов
+- список комнат (`admin`, `user`)
+- список доступных слотов по комнате и дате (`admin`, `user`)
+- создание брони (`user`)
+- идемпотентная отмена своей брони (`user`)
+- список всех броней с пагинацией (`admin`)
+- список будущих броней текущего пользователя (`user`)
+- хранение и передача времени в UTC
+- unit-тесты
+- integration / E2E сценарии
 
-### Время
-- все значения времени хранятся и отдаются в UTC;
-- для слотов используется `TIMESTAMPTZ`.
+### Дополнительная часть
+Реализовано:
+- `POST /register`
+- `POST /login`
+- опциональный `createConferenceLink`
+- mock Conference Service
+- `Makefile`
+- `Dockerfile`
+- `docker-compose.yml`
+- `.golangci.yml`
+- Swagger scaffold в `docs/swagger.md`
 
-### PostgreSQL
-Слои работы с БД:
-- `internal/db` — pool и применение миграций;
-- `internal/repository/postgres` — SQL-репозитории;
-- `internal/service` — бизнес-логика без SQL в handlers.
 
-Миграции лежат в:
-- `migrations/` — видимые SQL файлы в корне проекта;
-- `internal/db/migrations/` — embedded-копия для применения приложением.
+---
 
-## Структура проекта
+## 3. Архитектурные решения
+
+## Почему слоты хранятся в БД
+По условию у слота должен быть **стабильный UUID**, потому что бронь создаётся по `slotId`.
+
+Из этого следует, что слоты нельзя считать просто временными объектами «на лету». Поэтому в проекте слоты:
+- генерируются системой
+- сохраняются в PostgreSQL
+- имеют стабильный ID
+- могут быть безопасно использованы при создании брони
+
+
+## Почему используется PostgreSQL
+PostgreSQL здесь решает три важные задачи:
+
+1. **Хранение данных и связей**
+   - пользователи
+   - переговорки
+   - расписания
+   - слоты
+   - брони
+
+2. **Ограничения целостности на уровне БД**
+   - одно расписание на комнату
+   - один активный booking на слот
+   - уникальность слота
+
+
+## Работа со временем
+Все даты и время:
+- хранятся в UTC
+- передаются в UTC
+- возвращаются в UTC
+
+---
+
+## 4. Структура проекта
 
 ```text
-cmd/server            # запуск HTTP API
-cmd/seed              # наполнение тестовыми данными
-internal/app          # сборка зависимостей
-internal/auth         # JWT
-internal/config       # env config
-internal/db           # pool + migrations
-internal/httpapi      # handlers и ответы
-internal/middleware   # auth middleware
-internal/models       # доменные модели
-internal/repository   # postgres + memory repos
-internal/service      # бизнес-логика
-internal/conference   # mock integration
-migrations            # SQL migration files
-tests                 # HTTP и DB tests
+cmd/
+  server/               
+  seed/                
+
+internal/
+  app/                  
+  auth/                 
+  conference/           
+  config/               
+  db/                  
+  httpapi/              
+  middleware/           
+  models/               
+  repository/
+    memory/             
+    postgres/           
+  service/              
+
+migrations/            
+api/                    
+docs/                  
+tests/                  
 ```
 
-## Запуск
+---
+
+## 5. Локальный запуск
+
+## Что должно быть установлено
+Нужно иметь:
+- Go 1.22+
+- Docker
+- Docker Compose
+- Git
+
+Проверка:
 
 ```bash
-make up
+go version
+docker --version
+docker compose version
+git --version
 ```
 
-Сервис будет доступен на `http://localhost:8080`.
 
-### Наполнение тестовыми данными
+## 6. Запуск проекта
 
-```bash
-make seed
-```
-
-## Проверка
-
-### 1. Подтянуть зависимости
+Из корня проекта:
 
 ```bash
 go mod tidy
-```
-
-### 2. Проверить форматирование и сборку
-
-```bash
-gofmt -w ./cmd ./internal ./tests
 go build ./...
-```
-
-### 3. Прогнать unit и HTTP tests
-
-```bash
 go test ./... -cover
 ```
 
-### 4. Поднять сервис с Postgres
+Запуск через Docker Compose:
 
 ```bash
 docker compose up --build
 ```
 
-### 5. Опционально прогнать PostgreSQL integration test
+После запуска сервис будет доступен по адресу:
 
-```bash
-RUN_DB_TESTS=1 go test ./tests -run TestPostgresRepositories -v
+```text
+http://localhost:8080
 ```
 
-## Основные ручки
-- `POST /dummyLogin`
-- `POST /register`
-- `POST /login`
-- `GET /rooms/list`
-- `POST /rooms/create`
-- `POST /rooms/{roomId}/schedule/create`
-- `GET /rooms/{roomId}/slots/list?date=YYYY-MM-DD`
-- `POST /bookings/create`
-- `GET /bookings/list?page=1&pageSize=20`
-- `GET /bookings/my`
-- `POST /bookings/{bookingId}/cancel`
-- `GET /_info`
+Проверка health endpoint:
 
-## Conference link
-Если при создании брони указан `createConferenceLink=true`, сервис вызывает mock conference service и сохраняет ссылку в брони.
+```bash
+curl -i http://localhost:8080/_info
+```
 
-Принятое поведение при сбоях внешнего сервиса:
-- если внешняя интеграция не вернула ссылку, бронь не создаётся;
-- бронь и ссылка сохраняются атомарно в рамках операции создания брони.
+Ожидается `200 OK`.
 
-## Swagger
-В `docs/swagger.md` добавлен scaffold для генерации Swagger через `swaggo/swag`.
+Остановка проекта:
 
-## Что осталось подтвердить локально
-- `go mod tidy`;
-- успешный `go build ./...`;
-- успешный `go test ./...`;
-- успешный `docker compose up --build`;
-- ручной smoke test через `dummyLogin -> create room -> create schedule -> list slots -> create booking -> cancel booking`.
+```bash
+docker compose down
+```
 
-## Что можно улучшить дальше
-- полноценные versioned migrations через `golang-migrate`;
-- реальная генерация Swagger из аннотаций и публикация UI;
-- нагрузочный сценарий и краткий отчёт;
-- observability: structured logging, tracing, metrics.
+Если нужно удалить volume с БД:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## 7. Makefile
+
+Доступные команды:
+
+```bash
+make up
+make seed
+make test
+make lint
+```
+
+### `make up`
+Поднимает PostgreSQL и приложение.
+
+### `make seed`
+Заполняет БД тестовыми данными.
+
+---
+
+## 8. Авторизация и права доступа
+
+## Как получить токен
+Для тестирования обязательной части используется `POST /dummyLogin`.
+
+### Получить admin token
+```bash
+curl -s -X POST http://localhost:8080/dummyLogin \
+  -H "Content-Type: application/json" \
+  -d '{"role":"admin"}'
+```
+
+### Получить user token
+```bash
+curl -s -X POST http://localhost:8080/dummyLogin \
+  -H "Content-Type: application/json" \
+  -d '{"role":"user"}'
+```
+
+Ответ:
+
+```json
+{"token":"<jwt>"}
+```
+
+### Сохранить токены в переменные shell
+```bash
+ADMIN_TOKEN='сюда_вставь_admin_token'
+USER_TOKEN='сюда_вставь_user_token'
+```
+
+### Что содержит JWT
+JWT содержит как минимум:
+- `user_id`
+- `role`
+
+Это важно, потому что:
+- сервер определяет роль пользователя по токену
+- `user_id` для брони берётся из токена, а не из request body
+
+---
+
+## 9. Ручной сценарий проверки API
+
+Ниже — полный сценарий, который можно повторить вручную.
+
+## 9.1 Создание комнаты (`admin`)
+
+```bash
+curl -s -X POST http://localhost:8080/rooms/create \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"Room A",
+    "description":"Main room",
+    "capacity":8
+  }'
+```
+
+Пример ответа:
+
+```json
+{
+  "room": {
+    "id": "f2543680-c481-4a8e-8fba-04add0b1eba8",
+    "name": "Room A",
+    "description": "Main room",
+    "capacity": 8,
+    "createdAt": "2026-03-25T16:52:31.515028Z"
+  }
+}
+```
+
+Сохранить ID комнаты:
+
+```bash
+ROOM_ID='f2543680-c481-4a8e-8fba-04add0b1eba8'
+```
+
+## 9.2 Создание расписания (`admin`)
+
+```bash
+curl -s -X POST http://localhost:8080/rooms/$ROOM_ID/schedule/create \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "roomId":"'"$ROOM_ID"'",
+    "daysOfWeek":[1,2,3,4,5],
+    "startTime":"09:00",
+    "endTime":"18:00"
+  }'
+```
+
+Что важно:
+- расписание можно создать только один раз
+- повторный вызов должен вернуть ошибку `SCHEDULE_EXISTS`
+- `daysOfWeek` принимает значения только от `1` до `7`
+
+## 9.3 Получение списка комнат (`admin` и `user`)
+
+```bash
+curl -s http://localhost:8080/rooms/list \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+## 9.4 Получение доступных слотов (`admin` и `user`)
+
+```bash
+curl -s "http://localhost:8080/rooms/$ROOM_ID/slots/list?date=2026-03-26" \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+В ответе придёт список свободных слотов на эту дату.
+
+Пример первого слота:
+
+```json
+{
+  "id": "23701be5-2641-55ba-975e-aabdfdb3e6fd",
+  "roomId": "f2543680-c481-4a8e-8fba-04add0b1eba8",
+  "start": "2026-03-26T09:00:00Z",
+  "end": "2026-03-26T09:30:00Z"
+}
+```
+
+Сохранить ID слота:
+
+```bash
+SLOT_ID='23701be5-2641-55ba-975e-aabdfdb3e6fd'
+```
+
+## 9.5 Создание брони (`user`)
+
+```bash
+curl -s -X POST http://localhost:8080/bookings/create \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slotId":"'"$SLOT_ID"'",
+    "createConferenceLink": true
+  }'
+```
+
+Что важно:
+- бронь доступна только роли `user`
+- `admin` не должен мочь забронировать слот
+- если слот уже занят, вернётся `409 SLOT_ALREADY_BOOKED`
+- если слот в прошлом, вернётся `400 INVALID_REQUEST`
+
+## 9.6 Список своих броней (`user`)
+
+```bash
+curl -s http://localhost:8080/bookings/my \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+Что важно:
+- возвращаются только **будущие** брони
+- `userId` берётся из JWT
+
+## 9.7 Список всех броней (`admin`)
+
+```bash
+curl -s "http://localhost:8080/bookings/list?page=1&pageSize=20" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Что важно:
+- доступно только `admin`
+- работает пагинация
+- `pageSize` ограничен 100
+
+## 9.8 Отмена своей брони (`user`)
+
+```bash
+BOOKING_ID='сюда_вставь_booking_id'
+
+curl -s -X POST http://localhost:8080/bookings/$BOOKING_ID/cancel \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+### Идемпотентность отмены
+Повторный вызов той же команды:
+
+```bash
+curl -s -X POST http://localhost:8080/bookings/$BOOKING_ID/cancel \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+должен снова вернуть `200 OK` и бронь со статусом `cancelled`.
+
+---
+
+## 10. Дополнительные endpoint'ы
+
+## Регистрация
+```bash
+curl -s -X POST http://localhost:8080/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email":"user@example.com",
+    "password":"strong-password",
+    "role":"user"
+  }'
+```
+
+## Логин
+```bash
+curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email":"user@example.com",
+    "password":"strong-password"
+  }'
+```
+
+---
+
+## 11. Тесты
+
+## Unit tests
+Покрывают бизнес-логику сервисов.
+
+Запуск:
+
+```bash
+go test ./... -cover
+```
+
+## HTTP integration / E2E tests
+Покрывают сценарии:
+- создание комнаты
+- создание расписания
+- создание брони
+- отмена брони
+
+
+---
+
